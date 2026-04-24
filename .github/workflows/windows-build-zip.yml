@@ -1,0 +1,525 @@
+# ─────────────────────────────────────────────────────────────
+# Windows Build + Create ZIP
+# ─────────────────────────────────────────────────────────────
+name: "Windows Build & ZIP"
+on:
+  push:
+    tags:
+      - 'release-*'
+permissions:
+  contents: write
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # PHASE 4: Build nginx.exe on Windows
+  # ─────────────────────────────────────────────────────────
+  build-windows:
+    name: "🪟 Build Windows Binary"
+    runs-on: windows-2022
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#release-}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      # Set up Visual Studio compiler environment
+      - name: Set up MSVC compiler
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+      # Install MSYS2 (Unix-like shell for running make on Windows)
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          install: make tar gzip file perl
+      # ─────────────────────────────────────────────────────
+      # Auto-detect dependency versions from nginx source
+      # ─────────────────────────────────────────────────────
+      - name: Detect required dependency versions
+        id: deps
+        shell: msys2 {0}
+        run: |
+          echo "### 🔍 Detecting Dependency Versions" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Reading versions from nginx source code..."
+          echo ""
+          echo "=== References found in misc/GNUmakefile ==="
+          grep -E "openssl-|zlib-|pcre2-" misc/GNUmakefile || true
+          echo ""
+          echo "=== References found in auto/ ==="
+          grep -rE "openssl-|zlib-|pcre2-" auto/ || true
+          # Extract versions
+          # -r = recursive search
+          # -o = output only the matched part
+          # -h = hide filename from output
+          # -P = Perl-compatible regex
+          OPENSSL_VER=$(grep -rohP 'openssl-\K[0-9]+\.[0-9]+\.[0-9]+[a-z]?' misc/GNUmakefile auto/ | head -1)
+          ZLIB_VER=$(grep -rohP 'zlib-\K[0-9]+\.[0-9]+(\.[0-9]+)?' misc/GNUmakefile auto/ | head -1)
+          PCRE2_VER=$(grep -rohP 'pcre2-\K[0-9]+\.[0-9]+' misc/GNUmakefile auto/ | head -1)
+          # Validate we found all versions
+          error=0
+          if [ -z "$OPENSSL_VER" ]; then
+            echo "❌ Could not detect OpenSSL version from source!"
+            echo "- ❌ OpenSSL — version not found in source" >> "$GITHUB_STEP_SUMMARY"
+            error=1
+          else
+            echo "✅ OpenSSL: ${OPENSSL_VER}"
+            echo "- ✅ OpenSSL: \`${OPENSSL_VER}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -z "$ZLIB_VER" ]; then
+            echo "❌ Could not detect zlib version from source!"
+            echo "- ❌ zlib — version not found in source" >> "$GITHUB_STEP_SUMMARY"
+            error=1
+          else
+            echo "✅ zlib:    ${ZLIB_VER}"
+            echo "- ✅ zlib: \`${ZLIB_VER}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -z "$PCRE2_VER" ]; then
+            echo "❌ Could not detect PCRE2 version from source!"
+            echo "- ❌ PCRE2 — version not found in source" >> "$GITHUB_STEP_SUMMARY"
+            error=1
+          else
+            echo "✅ PCRE2:   ${PCRE2_VER}"
+            echo "- ✅ PCRE2: \`${PCRE2_VER}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$error" -eq 1 ]; then
+            echo ""
+            echo "══════════════════════════════════════════════════════════"
+            echo "ERROR: Could not auto-detect some dependency versions."
+            echo ""
+            echo "Please check misc/GNUmakefile and auto/ directory"
+            echo "for the expected dependency versions."
+            echo "══════════════════════════════════════════════════════════"
+            exit 1
+          fi
+          echo ""
+          echo "✅ All versions detected from source." >> "$GITHUB_STEP_SUMMARY"
+          # Export for next steps
+          echo "openssl_version=${OPENSSL_VER}" >> "$GITHUB_OUTPUT"
+          echo "zlib_version=${ZLIB_VER}" >> "$GITHUB_OUTPUT"
+          echo "pcre2_version=${PCRE2_VER}" >> "$GITHUB_OUTPUT"
+      # ─────────────────────────────────────────────────────
+      # Download and extract dependencies
+      # ─────────────────────────────────────────────────────
+      - name: Download dependencies
+        shell: msys2 {0}
+        run: |
+          # ─────────────────────────────────────────────
+          # Helper function: download, verify, and extract
+          # ─────────────────────────────────────────────
+          download_and_extract() {
+            local url="$1"
+            local filename="$2"
+            local display_name="$3"
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "⬇️  Downloading: ${display_name}"
+            echo "    URL: ${url}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            # -f = fail on HTTP errors (404, 500, etc.)
+            # -S = show error messages
+            # -L = follow redirects
+            if ! curl -fSL -o "$filename" "$url"; then
+              echo ""
+              echo "❌ Failed to download: ${display_name}"
+              echo "   URL: ${url}"
+              echo ""
+              echo "   Possible causes:"
+              echo "   - Version doesn't exist (check the project's releases page)"
+              echo "   - URL structure has changed"
+              echo "   - Network/firewall issue"
+              exit 1
+            fi
+            # Verify it's actually a gzip file, not an HTML error page
+            file_type=$(file "$filename")
+            if ! echo "$file_type" | grep -q "gzip"; then
+              echo ""
+              echo "❌ Downloaded file is NOT a gzip archive!"
+              echo "   Expected: gzip compressed data"
+              echo "   Got: ${file_type}"
+              echo ""
+              echo "   First 500 bytes of the file:"
+              echo "   ─────────────────────────────────────"
+              head -c 500 "$filename"
+              echo ""
+              echo "   ─────────────────────────────────────"
+              exit 1
+            fi
+            # Extract the archive
+            if ! tar xzf "$filename"; then
+              echo "❌ Failed to extract: ${filename}"
+              exit 1
+            fi
+            # Clean up the archive file
+            rm "$filename"
+            echo "✅ Successfully downloaded and extracted: ${display_name}"
+          }
+          # Read auto-detected versions
+          OPENSSL_VER="${{ steps.deps.outputs.openssl_version }}"
+          ZLIB_VER="${{ steps.deps.outputs.zlib_version }}"
+          PCRE2_VER="${{ steps.deps.outputs.pcre2_version }}"
+          # Create directories
+          mkdir -p objs.msvc8/lib
+          cd objs.msvc8/lib
+          echo "### 📦 Downloading Dependencies" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          # ─── OpenSSL ───
+          download_and_extract \
+            "https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz" \
+            "openssl.tar.gz" \
+            "OpenSSL ${OPENSSL_VER}"
+          echo "- ✅ OpenSSL \`${OPENSSL_VER}\`" >> "$GITHUB_STEP_SUMMARY"
+          # ─── zlib (using GitHub — zlib.net removes old versions) ───
+          download_and_extract \
+            "https://github.com/madler/zlib/releases/download/v${ZLIB_VER}/zlib-${ZLIB_VER}.tar.gz" \
+            "zlib.tar.gz" \
+            "zlib ${ZLIB_VER}"
+          echo "- ✅ zlib \`${ZLIB_VER}\`" >> "$GITHUB_STEP_SUMMARY"
+          # ─── PCRE2 ───
+          download_and_extract \
+            "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VER}/pcre2-${PCRE2_VER}.tar.gz" \
+            "pcre2.tar.gz" \
+            "PCRE2 ${PCRE2_VER}"
+          echo "- ✅ PCRE2 \`${PCRE2_VER}\`" >> "$GITHUB_STEP_SUMMARY"
+          # Fix missing inttypes.h header for MSVC compatibility
+          echo '#include <stdint.h>' > pcre2-${PCRE2_VER}/src/inttypes.h
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ All dependencies downloaded and extracted." >> "$GITHUB_STEP_SUMMARY"
+      # ─────────────────────────────────────────────────────
+      # Verify dependency directory structure before building
+      # ─────────────────────────────────────────────────────
+      - name: Verify dependency structure
+        shell: msys2 {0}
+        run: |
+          OPENSSL_VER="${{ steps.deps.outputs.openssl_version }}"
+          ZLIB_VER="${{ steps.deps.outputs.zlib_version }}"
+          PCRE2_VER="${{ steps.deps.outputs.pcre2_version }}"
+          echo "=== Directory structure of objs.msvc8/lib/ ==="
+          ls -la objs.msvc8/lib/
+          echo ""
+          echo "=== Checking for key header files ==="
+          error=0
+          # ─── Check zlib.h ───
+          if [ -f "objs.msvc8/lib/zlib-${ZLIB_VER}/zlib.h" ]; then
+            echo "✅ zlib.h found at: objs.msvc8/lib/zlib-${ZLIB_VER}/zlib.h"
+          else
+            echo "❌ zlib.h NOT found at expected location!"
+            echo "   Expected: objs.msvc8/lib/zlib-${ZLIB_VER}/zlib.h"
+            echo ""
+            echo "   Contents of objs.msvc8/lib/zlib-${ZLIB_VER}/:"
+            ls -la "objs.msvc8/lib/zlib-${ZLIB_VER}/" 2>/dev/null || echo "   (directory doesn't exist!)"
+            echo ""
+            echo "   Searching for zlib.h anywhere under objs.msvc8/:"
+            find objs.msvc8/ -name "zlib.h" 2>/dev/null || echo "   (not found anywhere!)"
+            error=1
+          fi
+          # ─── Check OpenSSL ───
+          if [ -d "objs.msvc8/lib/openssl-${OPENSSL_VER}/include" ]; then
+            echo "✅ OpenSSL include dir found at: objs.msvc8/lib/openssl-${OPENSSL_VER}/include"
+          elif [ -f "objs.msvc8/lib/openssl-${OPENSSL_VER}/Configure" ]; then
+            echo "✅ OpenSSL source found at: objs.msvc8/lib/openssl-${OPENSSL_VER}/ (will be built by nmake)"
+          else
+            echo "❌ OpenSSL NOT found at expected location!"
+            echo "   Expected: objs.msvc8/lib/openssl-${OPENSSL_VER}/"
+            echo ""
+            echo "   Contents of objs.msvc8/lib/:"
+            ls -la objs.msvc8/lib/ 2>/dev/null
+            echo ""
+            echo "   Searching for openssl directories:"
+            find objs.msvc8/lib/ -maxdepth 1 -type d -name "openssl*" 2>/dev/null || echo "   (none found!)"
+            error=1
+          fi
+          # ─── Check PCRE2 ───
+          if [ -f "objs.msvc8/lib/pcre2-${PCRE2_VER}/src/pcre2.h.generic" ]; then
+            echo "✅ PCRE2 headers found at: objs.msvc8/lib/pcre2-${PCRE2_VER}/src/"
+          else
+            echo "❌ PCRE2 headers NOT found at expected location!"
+            echo "   Expected: objs.msvc8/lib/pcre2-${PCRE2_VER}/src/pcre2.h.generic"
+            echo ""
+            echo "   Contents of objs.msvc8/lib/pcre2-${PCRE2_VER}/src/:"
+            ls -la "objs.msvc8/lib/pcre2-${PCRE2_VER}/src/" 2>/dev/null || echo "   (directory doesn't exist!)"
+            error=1
+          fi
+          # ─── Check inttypes.h fix ───
+          if [ -f "objs.msvc8/lib/pcre2-${PCRE2_VER}/src/inttypes.h" ]; then
+            echo "✅ PCRE2 inttypes.h fix applied"
+          else
+            echo "❌ PCRE2 inttypes.h fix NOT found!"
+            error=1
+          fi
+          if [ "$error" -eq 1 ]; then
+            echo ""
+            echo "══════════════════════════════════════════════════════════"
+            echo "ERROR: Dependency structure verification failed!"
+            echo ""
+            echo "The build will likely fail due to missing headers."
+            echo "Check the download step output for issues."
+            echo "══════════════════════════════════════════════════════════"
+            exit 1
+          fi
+          echo ""
+          echo "✅ All dependency files verified!"
+      # ─────────────────────────────────────────────────────
+      # Build nginx for Windows
+      # ─────────────────────────────────────────────────────
+      - name: Build nginx for Windows (configure)
+        shell: msys2 {0}
+        run: |
+          echo "### 🔨 Building nginx for Windows" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Current directory: $(pwd)"
+          echo ""
+          echo "Running: make -f misc/GNUmakefile win32"
+          make -f misc/GNUmakefile win32
+          echo "- ✅ Configure completed" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build nginx for Windows (compile)
+        shell: cmd
+        run: |
+          echo === Current directory ===
+          cd
+          echo.
+          echo === Checking dependency directories ===
+          dir objs.msvc8\lib
+          echo.
+          echo === Starting nmake ===
+          nmake
+      - name: Verify nginx.exe was built
+        shell: bash
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -f objs.msvc8/nginx.exe ]; then
+            echo "❌ nginx.exe was NOT built!"
+            echo "- ❌ \`nginx.exe\` was not created" >> "$GITHUB_STEP_SUMMARY"
+            echo ""
+            echo "Contents of objs.msvc8/:"
+            ls -la objs.msvc8/ || echo "(directory doesn't exist)"
+            exit 1
+          fi
+          FILE_SIZE=$(ls -lh objs.msvc8/nginx.exe | awk '{print $5}')
+          echo "✅ nginx.exe built successfully (${FILE_SIZE})"
+          echo "- ✅ \`nginx.exe\` built successfully (\`${FILE_SIZE}\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+          echo "File details:"
+          ls -la objs.msvc8/nginx.exe
+      # ─────────────────────────────────────────────────────
+      # Upload nginx.exe for the ZIP creation job
+      # ─────────────────────────────────────────────────────
+      - name: Upload nginx.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: objs.msvc8/nginx.exe
+          retention-days: 5
+  # ─────────────────────────────────────────────────────────
+  # PHASE 5: Create and Sign the Windows ZIP
+  # (Per release checklist: nginx.exe is taken back to a
+  #  supported platform (Linux) to create the ZIP using
+  #  make -f misc/GNUmakefile zip)
+  # ─────────────────────────────────────────────────────────
+  create-zip:
+    name: "📦 Create Windows ZIP"
+    needs: build-windows
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#release-}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "### 📦 Creating Windows ZIP for nginx ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+      # ─────────────────────────────────────────────────────
+      # Download nginx.exe from the Windows build job
+      # (Checklist: "Release engineer takes nginx.exe back
+      #  on a supported platform to make zip")
+      # ─────────────────────────────────────────────────────
+      - name: Download nginx.exe
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-binary
+          path: objs.msvc8/
+      - name: Verify nginx.exe downloaded
+        run: |
+          if [ ! -f objs.msvc8/nginx.exe ]; then
+            echo "❌ nginx.exe not found in downloaded artifacts!"
+            echo ""
+            echo "Contents of objs.msvc8/:"
+            ls -la objs.msvc8/ || echo "(directory doesn't exist)"
+            exit 1
+          fi
+          FILE_SIZE=$(ls -lh objs.msvc8/nginx.exe | awk '{print $5}')
+          echo "✅ nginx.exe downloaded from build job (${FILE_SIZE})"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ✅ Downloaded \`nginx.exe\` from Windows build job (\`${FILE_SIZE}\`)" >> "$GITHUB_STEP_SUMMARY"
+      # ─────────────────────────────────────────────────────
+      # Auto-detect dependency versions from nginx source
+      # ─────────────────────────────────────────────────────
+      - name: Detect required dependency versions
+        id: deps
+        run: |
+          echo "Detecting dependency versions from nginx source..."
+          # -r = recursive search
+          # -o = output only the matched part
+          # -h = hide filename from output
+          # -P = Perl-compatible regex
+          OPENSSL_VER=$(grep -rohP 'openssl-\K[0-9]+\.[0-9]+\.[0-9]+[a-z]?' misc/GNUmakefile auto/ | head -1)
+          ZLIB_VER=$(grep -rohP 'zlib-\K[0-9]+\.[0-9]+(\.[0-9]+)?' misc/GNUmakefile auto/ | head -1)
+          PCRE2_VER=$(grep -rohP 'pcre2-\K[0-9]+\.[0-9]+' misc/GNUmakefile auto/ | head -1)
+          error=0
+          if [ -z "$OPENSSL_VER" ]; then
+            echo "❌ Could not detect OpenSSL version!"
+            error=1
+          else
+            echo "✅ OpenSSL: ${OPENSSL_VER}"
+          fi
+          if [ -z "$ZLIB_VER" ]; then
+            echo "❌ Could not detect zlib version!"
+            error=1
+          else
+            echo "✅ zlib:    ${ZLIB_VER}"
+          fi
+          if [ -z "$PCRE2_VER" ]; then
+            echo "❌ Could not detect PCRE2 version!"
+            error=1
+          else
+            echo "✅ PCRE2:   ${PCRE2_VER}"
+          fi
+          if [ "$error" -eq 1 ]; then
+            echo "❌ Could not detect some versions from source."
+            exit 1
+          fi
+          echo "openssl_version=${OPENSSL_VER}" >> "$GITHUB_OUTPUT"
+          echo "zlib_version=${ZLIB_VER}" >> "$GITHUB_OUTPUT"
+          echo "pcre2_version=${PCRE2_VER}" >> "$GITHUB_OUTPUT"
+      # ─────────────────────────────────────────────────────
+      # Set up dependencies for ZIP creation
+      # (Checklist steps: mkdir -p objs.msvc8/lib, then
+      #  extract openssl, zlib, pcre2 into objs.msvc8/lib/)
+      # ─────────────────────────────────────────────────────
+      - name: Set up dependencies for ZIP creation
+        run: |
+          # Helper function
+          download_and_extract() {
+            local url="$1"
+            local filename="$2"
+            local display_name="$3"
+            echo "⬇️  Downloading: ${display_name}"
+            if ! curl -fSL -o "$filename" "$url"; then
+              echo "❌ Failed to download: ${display_name}"
+              echo "   URL: ${url}"
+              exit 1
+            fi
+            file_type=$(file "$filename")
+            if ! echo "$file_type" | grep -q "gzip"; then
+              echo "❌ Downloaded file is NOT a gzip archive!"
+              echo "   Expected: gzip compressed data"
+              echo "   Got: ${file_type}"
+              head -c 500 "$filename"
+              exit 1
+            fi
+            tar xzf "$filename"
+            rm "$filename"
+            echo "✅ Extracted: ${display_name}"
+          }
+          # Read auto-detected versions
+          OPENSSL_VER="${{ steps.deps.outputs.openssl_version }}"
+          ZLIB_VER="${{ steps.deps.outputs.zlib_version }}"
+          PCRE2_VER="${{ steps.deps.outputs.pcre2_version }}"
+          mkdir -p objs.msvc8/lib
+          cd objs.msvc8/lib
+          # ─── OpenSSL ───
+          download_and_extract \
+            "https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz" \
+            "openssl.tar.gz" \
+            "OpenSSL ${OPENSSL_VER}"
+          # ─── zlib (using GitHub — zlib.net removes old versions) ───
+          download_and_extract \
+            "https://github.com/madler/zlib/releases/download/v${ZLIB_VER}/zlib-${ZLIB_VER}.tar.gz" \
+            "zlib.tar.gz" \
+            "zlib ${ZLIB_VER}"
+          # ─── PCRE2 ───
+          download_and_extract \
+            "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VER}/pcre2-${PCRE2_VER}.tar.gz" \
+            "pcre2.tar.gz" \
+            "PCRE2 ${PCRE2_VER}"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ✅ Dependencies downloaded for ZIP creation" >> "$GITHUB_STEP_SUMMARY"
+      # ─────────────────────────────────────────────────────
+      # Verify the directory structure matches what the
+      # checklist expects before running make zip:
+      #   objs.msvc8/nginx.exe
+      #   objs.msvc8/lib/openssl-X.X.X/
+      #   objs.msvc8/lib/zlib-X.X.X/
+      #   objs.msvc8/lib/pcre2-X.XX/
+      # ─────────────────────────────────────────────────────
+      - name: Verify directory structure
+        run: |
+          echo "=== objs.msvc8/ ==="
+          ls -la objs.msvc8/
+          echo ""
+          echo "=== objs.msvc8/lib/ ==="
+          ls -la objs.msvc8/lib/
+          echo ""
+          if [ ! -f objs.msvc8/nginx.exe ]; then
+            echo "❌ nginx.exe missing from objs.msvc8/"
+            exit 1
+          fi
+          echo "✅ Directory structure verified"
+      # ─────────────────────────────────────────────────────
+      # Create the ZIP package
+      # (Checklist: "make -f misc/GNUmakefile zip")
+      # ─────────────────────────────────────────────────────
+      - name: Create ZIP package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "### 📦 Creating Windows ZIP" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          make -f misc/GNUmakefile zip
+          if [ ! -f "nginx-${VERSION}.zip" ]; then
+            echo "❌ ZIP file was not created!"
+            echo ""
+            echo "Expected: nginx-${VERSION}.zip"
+            echo ""
+            echo "Files in current directory:"
+            ls -la
+            exit 1
+          fi
+          FILE_SIZE=$(ls -lh "nginx-${VERSION}.zip" | awk '{print $5}')
+          echo "✅ ZIP created: nginx-${VERSION}.zip (${FILE_SIZE})"
+          echo "- ✅ Created \`nginx-${VERSION}.zip\` (\`${FILE_SIZE}\`)" >> "$GITHUB_STEP_SUMMARY"
+      # ─────────────────────────────────────────────────────
+      # Generate SHA256 checksum
+      # ─────────────────────────────────────────────────────
+      - name: Generate SHA256 checksum
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sha256sum "nginx-${VERSION}.zip" > "nginx-${VERSION}.zip.sha256"
+          echo "✅ SHA256 checksum generated"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 🔢 SHA256 Checksum" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat "nginx-${VERSION}.zip.sha256" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      # ─────────────────────────────────────────────────────
+      # Upload unsigned ZIP
+      # ─────────────────────────────────────────────────────
+      - name: Upload unsigned ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zip-unsigned
+          path: |
+            nginx-${{ steps.version.outputs.version }}.zip
+            nginx-${{ steps.version.outputs.version }}.zip.sha256
+          retention-days: 5
