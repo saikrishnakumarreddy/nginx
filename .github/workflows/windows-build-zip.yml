@@ -320,13 +320,16 @@ jobs:
   # ─────────────────────────────────────────────────────────
   # PHASE 5: Create and Sign the Windows ZIP
   # (Per release checklist: nginx.exe is taken back to a
-  #  supported platform (Linux) to create the ZIP using
+  #  supported platform to create the ZIP using
   #  make -f misc/GNUmakefile zip)
+  #
+  # The GNUmakefile uses BSD sed syntax (sed -i '' ...),
+  # so this job must run on macOS where BSD sed is native.
   # ─────────────────────────────────────────────────────────
   create-zip:
     name: "📦 Create Windows ZIP"
     needs: build-windows
-    runs-on: ubuntu-24.04
+    runs-on: macos-latest
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v6
@@ -370,13 +373,11 @@ jobs:
         id: deps
         run: |
           echo "Detecting dependency versions from nginx source..."
-          # -r = recursive search
-          # -o = output only the matched part
-          # -h = hide filename from output
-          # -P = Perl-compatible regex
-          OPENSSL_VER=$(grep -rohP 'openssl-\K[0-9]+\.[0-9]+\.[0-9]+[a-z]?' misc/GNUmakefile auto/ | head -1)
-          ZLIB_VER=$(grep -rohP 'zlib-\K[0-9]+\.[0-9]+(\.[0-9]+)?' misc/GNUmakefile auto/ | head -1)
-          PCRE2_VER=$(grep -rohP 'pcre2-\K[0-9]+\.[0-9]+' misc/GNUmakefile auto/ | head -1)
+          # macOS grep uses -E for extended regex (no -P support)
+          # Using sed instead for version extraction
+          OPENSSL_VER=$(grep -rohE 'openssl-[0-9]+\.[0-9]+\.[0-9]+[a-z]?' misc/GNUmakefile auto/ | head -1 | sed 's/openssl-//')
+          ZLIB_VER=$(grep -rohE 'zlib-[0-9]+\.[0-9]+(\.[0-9]+)?' misc/GNUmakefile auto/ | head -1 | sed 's/zlib-//')
+          PCRE2_VER=$(grep -rohE 'pcre2-[0-9]+\.[0-9]+' misc/GNUmakefile auto/ | head -1 | sed 's/pcre2-//')
           error=0
           if [ -z "$OPENSSL_VER" ]; then
             echo "❌ Could not detect OpenSSL version!"
@@ -457,8 +458,7 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- ✅ Dependencies downloaded for ZIP creation" >> "$GITHUB_STEP_SUMMARY"
       # ─────────────────────────────────────────────────────
-      # Verify the directory structure matches what the
-      # checklist expects before running make zip:
+      # Verify directory structure before running make zip
       #   objs.msvc8/nginx.exe
       #   objs.msvc8/lib/openssl-X.X.X/
       #   objs.msvc8/lib/zlib-X.X.X/
@@ -505,7 +505,7 @@ jobs:
       - name: Generate SHA256 checksum
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          sha256sum "nginx-${VERSION}.zip" > "nginx-${VERSION}.zip.sha256"
+          shasum -a 256 "nginx-${VERSION}.zip" > "nginx-${VERSION}.zip.sha256"
           echo "✅ SHA256 checksum generated"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### 🔢 SHA256 Checksum" >> "$GITHUB_STEP_SUMMARY"
