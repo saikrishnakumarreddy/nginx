@@ -5,6 +5,122 @@
 <change_log title="nginx">
 
 
+<changes ver="1.31.9" date="2026-11-18">
+
+<change type="change">
+<para lang="ru">
+клиент мог передать большой объём данных обрамления chunked-тела
+при малом объёме или отсутствии данных тела
+без срабатывания flood detection;<br/>
+теперь nginx учитывает данные обрамления.
+Сообщил jskoetsier.
+</para>
+<para lang="en">
+clients could send excessive chunk framing with little or no body data
+without triggering flood detection;<br/>
+nginx now accounts for the framing.
+Reported by jskoetsier.
+</para>
+</change>
+
+<change type="change">
+<para lang="ru">
+теперь nginx всегда возвращает ошибку,
+если за именем заголовка не следует двоеточие.
+</para>
+<para lang="en">
+now nginx always returns an error
+if a header name is not followed by a colon.
+</para>
+</change>
+
+<change type="change">
+<para lang="ru">
+теперь nginx игнорирует неизвестные флаги в сообщениях SETTINGS HTTP/2.<br/>
+Спасибо Marek Ludha.
+</para>
+<para lang="en">
+nginx now ignores unknown flags in HTTP/2 SETTINGS messages.<br/>
+Thanks to Marek Ludha.
+</para>
+</change>
+
+<change type="change">
+<para lang="ru">
+при ошибке initgroups() рабочий процесс мог продолжить работу
+с дополнительными группами, унаследованными от главного процесса;
+теперь он завершается, кроме случая EPERM.
+</para>
+<para lang="en">
+a worker process could continue with supplementary groups inherited
+from the master process if initgroups() failed; now it exits, except on EPERM.
+</para>
+</change>
+
+<change type="bugfix">
+<para lang="ru">
+если база MMDB содержала координаты вне допустимого диапазона,
+переменные $geoip_latitude и $geoip_longitude могли возвращать
+некорректные значения;<br/>
+теперь такие значения считаются отсутствующими.
+Спасибо Y.Horie.
+</para>
+<para lang="en">
+out-of-range coordinates in an MMDB database might result in incorrect
+$geoip_latitude and $geoip_longitude values;<br/>
+such values are now reported as not found.
+Thanks to Y.Horie.
+</para>
+</change>
+
+<change type="bugfix">
+<para lang="ru">
+запросы могли зависнуть или быть отклонены HTTP/2-бэкендом,
+если nginx отбрасывал тело запроса при проксировании.
+</para>
+<para lang="en">
+requests might hang or be rejected by an HTTP/2 upstream
+if nginx discarded the request body while proxying.
+</para>
+</change>
+
+<change type="bugfix">
+<para lang="ru">
+переменные $cookie_... и модуль userid не находили cookie,
+следующие за cookie без имени; ошибка появилась в 0.1.29.
+</para>
+<para lang="en">
+$cookie_... variables and the userid module did not find cookies
+following a cookie without a name; the bug had appeared in 0.1.29.
+</para>
+</change>
+
+<change type="bugfix">
+<para lang="ru">
+значения некоторых заголовков HTTP/3-запросов
+не содержали пробел после точки с запятой.<br/>
+Спасибо Nexory.
+</para>
+<para lang="en">
+some HTTP/3 request header values lacked a space after a semicolon.<br/>
+Thanks to Nexory.
+</para>
+</change>
+
+<change type="bugfix">
+<para lang="ru">
+директива "index" могла использовать устаревшие значения
+некэшируемых переменных.
+</para>
+<para lang="en">
+the "index" directive could use stale values
+for non-cacheable variables.
+</para>
+</change>
+
+</changes>
+
+
 <changes ver="1.31.8" date="2026-10-21">
 
 <change>
